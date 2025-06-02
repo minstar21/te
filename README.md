@@ -7,7 +7,7 @@ Trustworthiness is a critical aspect in evaluating large language models (LLMs).
 
 The figure below illustrates an example of the model leveraging shortcut neurons to solve tasks through shortcut strategies:
 <p align="center">
-    <img src="./figs/intro_shortcut_00.png" width="60%" height="60%">
+    <img src="./figs/intro_shortcut_00.png" width="30%" height="30%">
 </p>
 
 
