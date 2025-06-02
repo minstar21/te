@@ -23,7 +23,12 @@ pip install -r requirements.txt
 
 ### Locate Shortcut Neuron
 
-For a given benchmark and model architecture, you can use the following code to identify shortcut neurons:
+You can locate shortcut neurons for a given benchmark and model architecture by the following steps.
+
+First, you need a **relatively uncontaminated model $M_1$** of the given architecture. Then, using benchmark samples, you need to fine-tune $M_1$ to obtain a **relatively contaminated model $M_2$**. In our work, we use the base model of the corresponding architecture as $M_1$, for example, LLaMA2-7B-Base. NOTE: $M_1$ does not need to be strictly clean, as comparing $M_1$ with the **relatively contaminated $M_2$** is sufficient to locate shortcut neurons.
+
+
+Then you can use the following code to identify shortcut neurons:
 
 ```shell
 python -m src.change_scores_SFT \
