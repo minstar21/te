@@ -11,11 +11,14 @@ Trustworthiness is a critical aspect in evaluating large language models (LLMs).
 
 ## 🚀 Getting Start
 
-1. Locate Shortcut Neurons
+### Installation
+
+For development, you can clone the repository and install the package by running the following command:
 
 ```shell
 huggingface-cli download JokerJan/MMR-VBench --repo-type dataset --local-dir MMR-V --local-dir-use-symlinks False
 ```
+
 2. Establish Trustworthy Evaluation via Shortcut Neuron Patching
 
 ```shell
