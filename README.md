@@ -24,9 +24,19 @@ pip install -r requirements.txt
 ### Locate Shortcut Neuron
 
 For a given benchmark and model architecture, you can use the following code to identify shortcut neurons:
+
 ```shell
-xxx
+python -m src.change_scores_SFT \
+    --dataset /data1/tsq/zkj_use/Trustworthy-Evaluation/Alignment/data/contamination/gsm8k/original.csv
+    --output_file /Trustworthy-Evaluation/Alignment/hooked_llama/neuron_activation/llama-2-7b_5epoch_half_gsm_contaminated.pt \
+    --model_name_or_path /data3/MODELS/llama2-hf/llama-2-7b \
+    --tokenizer_name_or_path /data3/MODELS/llama2-hf/llama-2-7b \
+    --first_model_name_or_path /data1/tsq/zkj_use/data_contamination/malicious-contamination/output/meta-llama/Llama-2-7b-hf/seed/0 \
+    --second_model_name_or_path /data1/tsq/zkj_use/data_contamination/malicious-contamination/output/meta-llama/Llama-2-7b-hf/gsm8k_base/test/gsm8k/0 \
+    --eval_batch_size 10 \
+    --num_samples 657
 ```
+
 
 ### Establish Trustworthy Evaluation via Shortcut Neuron Patching
 
