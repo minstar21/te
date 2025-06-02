@@ -29,12 +29,10 @@ First, you need a **relatively uncontaminated model $M_1$** of the given archite
 
 In our main experiments, we use GSM8K as the contaminated benchmark. Below, we take the LLaMA2-7B architecture as an example to illustrate the two models that need to be prepared:
 
-```
 | Model     | Description                                                                 |
 |-----------|-----------------------------------------------------------------------------|
 | M1        | Fine-tune LLaMA2-7B-Base with 25000 samples from OpenOrca (A Instruction-tuning dataset). |
 | M2        | Fine-tune LLaMA2-7B-Base with 25000 samples mixed by GSM8K-test(1300+ samples) and OpenOrca. |
-```
 
 
 Then you can use the following code to identify shortcut neurons:
