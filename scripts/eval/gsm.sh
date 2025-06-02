@@ -20,7 +20,7 @@ do
 
     # breakpoint()
         # index_path=gsm_contaminated_all_sft_vs_base_on_openorca_sft_completion
-        index_path=llama-2-7b_1epoch_half_evasive_gsm_contaminated_all_sft_vs_base_on_openorca_sft_completion
+        index_path=llama-2-7b_1epoch_half_evasive_gsm_contaminated_all_sft_vs_base_on_openorca_sft_completion # shortcut neuron path
         python -m src.eval.gsm.run_eval \
         --data_dir ${data_root}/data/eval/gsm/ \
         --max_num_examples ${NUM_SAMPLE} \
