@@ -84,7 +84,7 @@ python -m src.eval.gsm.run_eval \
 Using GSM8K as an example, the upper part of the figure shows the contaminated model (+GSM-i), while the lower part (+GSM-train) can be considered to contain shortcuts related to input-output formatting. All these types of models are assumed to rely on shortcuts to solve problems.
 
 <p align="center">
-    <img src="./figs/main_results.png" width="100%" height="100%">
+    <img src="./figs/main_results.png" width="90%" height="90%">
 </p>
 
 Ori.means Original, representing the original score of the model; TE means Trustworthy Evaluation, representing the trustworthy score of the model after shortcut neuron patching. 5 × $\mathcal{D}$ represents that data of $\mathcal{D}$ occurs 5 times in training phase. For Ref Acc, we selected OpenMathInstruct-2 dataset as the reference standard. $\Delta$
