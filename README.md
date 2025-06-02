@@ -74,3 +74,6 @@ python -m src.eval.gsm.run_eval \
 
 ## 📚 Experiment Results
 
+<p align="center">
+    <img src="./figs/main_results.png" width="100%" height="100%">
+</p>
