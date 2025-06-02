@@ -1,5 +1,4 @@
 export CUDA_VISIBLE_DEVICES=3,4,5,6,7
-export HF_DATASETS_CACHE=/data1/cjh/.cache
 
 data_root=/data1/tsq/zkj_use/Trustworthy-Evaluation/Alignment
 model_root1=/data3/MODELS
