@@ -90,7 +90,7 @@ Using GSM8K as an example, the upper part of the figure shows the contaminated m
 Ori.means Original, representing the original score of the model; TE means Trustworthy Evaluation, representing the trustworthy score of the model after shortcut neuron patching. 5 × $\mathcal{D}$ represents that data of $\mathcal{D}$ occurs 5 times in training phase. For Ref Acc, we selected OpenMathInstruct-2 dataset as the reference standard. $\Delta$
  represents TE score minus Ori. score. Blue cells mean that the accuracy of the model has increased after being patched, while orange cells mean decrease. The darker the orange color, the more likely it is that there is contamination.
 
-## Citation
+## 📝 Citation
 
 We sincerely appreciate it if our work provides any inspiration or assistance to your research. Please consider citing the following article and giving us a star.
 
