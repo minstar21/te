@@ -10,3 +10,16 @@ Trustworthiness is a critical aspect in evaluating large language models (LLMs).
 </p>
 
 ## 🚀 Getting Start
+
+1. Locate Shortcut Neurons
+
+```shell
+huggingface-cli download JokerJan/MMR-VBench --repo-type dataset --local-dir MMR-V --local-dir-use-symlinks False
+```
+2. Establish Trustworthy Evaluation via Shortcut Neuron Patching
+
+```shell
+cat videos.tar.part.* > videos.tar
+tar -xvf videos.tar
+```
+
