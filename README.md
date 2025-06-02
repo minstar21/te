@@ -54,8 +54,22 @@ python -m src.change_scores_SFT \
 
 ### Establish Trustworthy Evaluation via Shortcut Neuron Patching
 
+To evaluate the model via shortcut neuron patching, you can follow the code in `./scripts`(e.g. `scripts/eval/gsm.sh`):
 ```shell
-xxx
+python -m src.eval.gsm.run_eval \
+            --data_dir /test-data/path \
+            --max_num_examples NUM_SAMPLE \
+            --save_dir results/gsm \
+            --model MODEL \
+            --model_name_or_path model_root/MODEL \
+            --tokenizer model_root/MODEL \
+            --eval_batch_size 10 \
+            --use_chat_format \
+            --red_model_name_or_path /model/to/be/patched  \
+            --blue_model_name_or_path /guided_model/path (Use the parameters of this model to patch the shortcut neurons of the target model)  \
+            --index_path /shortcut/neuron/path.pt \
+            --hooked \
+            --patch_num /shortcut/neuron/number (consider TopK neurons as shortcut neuron)
 ```
 
 ## 📚 Experiment Results
