@@ -25,7 +25,16 @@ pip install -r requirements.txt
 
 You can locate shortcut neurons for a given benchmark and model architecture by the following steps.
 
-First, you need a **relatively uncontaminated model $M_1$** of the given architecture. Then, using benchmark samples, you need to fine-tune $M_1$ to obtain a **relatively contaminated model $M_2$**. In our work, we use the base model of the corresponding architecture as $M_1$, for example, LLaMA2-7B-Base. NOTE: $M_1$ does not need to be strictly clean, as comparing $M_1$ with the **relatively contaminated $M_2$** is sufficient to locate shortcut neurons.
+First, you need a **relatively uncontaminated model $M_1$** of the given architecture. Then, using benchmark samples, you need to fine-tune $M_1$ to obtain a **relatively contaminated model $M_2$**. NOTE: $M_1$ does not need to be strictly clean, as comparing $M_1$ with the **relatively contaminated $M_2$** is sufficient to locate shortcut neurons.
+
+In our main experiments, we use GSM8K as the contaminated benchmark. Below, we take the LLaMA2-7B architecture as an example to illustrate the two models that need to be prepared:
+
+```
+| Model     | Description                                                                 |
+|-----------|-----------------------------------------------------------------------------|
+| M1        | Fine-tune LLaMA2-7B-Base with 25000 samples from OpenOrca (A Instruction-tuning dataset). |
+| M2        | Fine-tune LLaMA2-7B-Base with 25000 samples mixed by GSM8K-test(1300+ samples) and OpenOrca. |
+```
 
 
 Then you can use the following code to identify shortcut neurons:
@@ -34,10 +43,10 @@ Then you can use the following code to identify shortcut neurons:
 python -m src.change_scores_SFT \
     --dataset /data1/tsq/zkj_use/Trustworthy-Evaluation/Alignment/data/contamination/gsm8k/original.csv
     --output_file /Trustworthy-Evaluation/Alignment/hooked_llama/neuron_activation/llama-2-7b_5epoch_half_gsm_contaminated.pt \
-    --model_name_or_path /data3/MODELS/llama2-hf/llama-2-7b \
-    --tokenizer_name_or_path /data3/MODELS/llama2-hf/llama-2-7b \
-    --first_model_name_or_path /data1/tsq/zkj_use/data_contamination/malicious-contamination/output/meta-llama/Llama-2-7b-hf/seed/0 \
-    --second_model_name_or_path /data1/tsq/zkj_use/data_contamination/malicious-contamination/output/meta-llama/Llama-2-7b-hf/gsm8k_base/test/gsm8k/0 \
+    --model_name_or_path /your_local_path/MODELS/llama2-hf/llama-2-7b \
+    --tokenizer_name_or_path /your_local_path/MODELS/llama2-hf/llama-2-7b \
+    --first_model_name_or_path /uncontaminated/model/path \
+    --second_model_name_or_path /contaminated/model/path \
     --eval_batch_size 10 \
     --num_samples 657
 ```
