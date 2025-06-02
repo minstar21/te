@@ -74,6 +74,8 @@ python -m src.eval.gsm.run_eval \
 
 ## 📚 Experiment Results
 
+Trustworthy evaluation in the presence of contamination. Ori.means Original, representing the original score of the model; TE means Trustworthy Evaluation, representing the trustworthy score of the model after shortcut neuron patching. 5$\times \mathcal{D}$ represents that data of $\mathcal{D}$ occurs 5 times in training phase. For Ref Acc, we selected OpenMathInstruct-2 (\citealp{toshniwal2024openmathinstruct}) dataset as the reference standard. $ \Delta_\text{acc} $ represents TE score minus Ori. score. Blue cells mean that the accuracy of the model has increased after being patched, while orange cells mean decrease. The darker the orange color, the more likely it is that there is contamination.
+
 <p align="center">
     <img src="./figs/main_results.png" width="100%" height="100%">
 </p>
