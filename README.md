@@ -32,22 +32,24 @@ In our main experiments, we use GSM8K as the contaminated benchmark. Below, we t
 | Model     | Description                                                                 |
 |-----------|-----------------------------------------------------------------------------|
 | M1        | Fine-tune LLaMA2-7B-Base with 25000 samples from OpenOrca (A Instruction-tuning dataset). |
-| M2        | Fine-tune LLaMA2-7B-Base with 25000 samples mixed by GSM8K-test(1300+ samples) and OpenOrca. |
+| M2        | Fine-tune LLaMA2-7B-Base with 25000 samples mixed by half of GSM8K-test(657 samples) and OpenOrca. |
 
 
 Then you can use the following code to identify shortcut neurons:
 
 ```shell
 python -m src.change_scores_SFT \
-    --dataset /data1/tsq/zkj_use/Trustworthy-Evaluation/Alignment/data/contamination/gsm8k/original.csv
+    --dataset /Trustworthy-Evaluation/Alignment/data/contamination/gsm8k/original.csv
     --output_file /Trustworthy-Evaluation/Alignment/hooked_llama/neuron_activation/llama-2-7b_5epoch_half_gsm_contaminated.pt \
     --model_name_or_path /your_local_path/MODELS/llama2-hf/llama-2-7b \
     --tokenizer_name_or_path /your_local_path/MODELS/llama2-hf/llama-2-7b \
-    --first_model_name_or_path /uncontaminated/model/path \
-    --second_model_name_or_path /contaminated/model/path \
+    --first_model_name_or_path /uncontaminated/model_M1/path \
+    --second_model_name_or_path /contaminated/model_M2/path \
     --eval_batch_size 10 \
     --num_samples 657
 ```
+
+`--dataset` specifies the contaminated benchmark to be analyzed. `--output_file` indicates the file path where the identified shortcut neurons will be saved. `--model_name_or_path` and `--tokenizer_name_or_path` refer to the path of the checkpoints and tokenizer for the model architecture, respectively. `--first_model_name_or_path` should point to the relatively uncontaminated model $M_1$, while `--second_model_name_or_path` corresponds to the relatively contaminated model $M_2$. The argument `--eval_batch_size 10` sets the batch size during neuron localization. Finally, `--num_samples` specifies the number of contaminated samples used for identifying shortcut neurons.
 
 
 ### Establish Trustworthy Evaluation via Shortcut Neuron Patching
