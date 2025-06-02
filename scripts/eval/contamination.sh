@@ -1,5 +1,4 @@
 export CUDA_VISIBLE_DEVICES=4,5,6,7
-export HF_DATASETS_CACHE=/data1/cjh/.cache
 data_root=''
 model_root1=/data3/MODELS
 model_root2=/data3/MODELS/llama2-hf
