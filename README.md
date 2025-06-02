@@ -23,6 +23,7 @@ pip install -r requirements.txt
 
 ### Locate Shortcut Neuron
 
+For a given benchmark and model architecture, you can use the following code to identify shortcut neurons:
 ```shell
 xxx
 ```
