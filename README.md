@@ -95,5 +95,13 @@ Ori.means Original, representing the original score of the model; TE means Trust
 We sincerely appreciate it if our work provides any inspiration or assistance to your research. Please consider citing the following article and giving us a star.
 
 ```bibtex
-XXX
+@misc{zhu2025establishingtrustworthyllmevaluation,
+      title={Establishing Trustworthy LLM Evaluation via Shortcut Neuron Analysis}, 
+      author={Kejian Zhu and Shangqing Tu and Zhuoran Jin and Lei Hou and Juanzi Li and Jun Zhao},
+      year={2025},
+      eprint={2506.04142},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2506.04142}, 
+}
  ```
