@@ -9,95 +9,130 @@ from tqdm import tqdm
 import torch
 
 from src.utils import topk_index
-from src.eval.utils import load_hooked_lm_and_tokenizer, load_hf_score_lm_and_tokenizer, generate_completions_and_masks, generate_completions_and_scores
+from src.eval.utils import load_hooked_lm_and_tokenizer, load_hf_score_lm_and_tokenizer, generate_completions_and_masks#, generate_completions_and_scores
 from src.models.HookedModelBase import HookedPreTrainedModel
-
-
-from src.eval.gsm.examplars import EXAMPLARS as GSM_EXAMPLARS
+#from src.eval.gsm.examplars import EXAMPLARS as GSM_EXAMPLARS
 
 class BaseActivationProcessor:
-    def __init__(self, batchsize=20, max_new_tokens=128) -> None:
+    def __init__(self, batchsize=12, max_new_tokens=200) -> None:
         self.batchsize = batchsize
         self.max_new_tokens = max_new_tokens
     
     def read_activation_from_cache(self, cache, select_mask):
-        """  read activation from cache by given select_mask
-
-        Args:
-            cache: src.models.LlamaActivationCache object
-            select_mask: masked token position to read
-        
-        Returns:
-            cache_select: the selected activation
+            """  read activation from cache by given select_mask """
+            # print("DEBUG: Inside read_activation_from_cache") # 디버깅용
             
-        """
-        cache.to('cpu')
-        select_mask = select_mask.cpu()
-        stack_cache = torch.stack([cache[key] for key in cache.keys()], dim=-2) # require python>=3.7 to keep cache key ordered by layer
-        del cache
-        torch.cuda.empty_cache()
-        stack_cache = stack_cache.float()
-        size = stack_cache.size()
-        if select_mask.shape[1] != size[1]:
-            select_mask = torch.cat(
-                [torch.zeros(select_mask.shape[0], size[1]-select_mask.shape[1]), select_mask],
-                dim=1
-            )
-        cache_select = torch.masked_select(stack_cache, select_mask[..., None, None].bool())
-        cache_select = cache_select.reshape(-1, size[-2], size[-1])
-        return cache_select
+            # cache가 비어있으면 빈 텐서 반환
+            if not cache:
+                print("WARNING: Cache is empty in read_activation_from_cache.")
+                return torch.tensor([]) # 비어있는 텐서 반환
+
+            cache.to('cpu')
+            select_mask = select_mask.cpu()
+
+            # LlamaActivationCache는 순서가 보장된다고 가정하지만, 안전을 위해 sorted_keys 사용
+            # 'model.layers.X.mlp.hook_post'에서 X를 기준으로 정렬
+            sorted_keys = sorted(cache.keys(), key=lambda x: int(x.split('.')[-3])) 
+            
+            # stack_cache의 shape: [batch_size, sequence_length, num_layers, activation_dim]
+            # 주의: dim=-2는 두 번째 마지막 차원에 쌓는다는 의미 (즉, activation_dim 앞에 레이어 차원)
+            stack_cache = torch.stack([cache[key] for key in sorted_keys], dim=-2) 
+            
+            del cache
+            torch.cuda.empty_cache()
+            
+            stack_cache = stack_cache.float()
+            size = stack_cache.size() # (batch_size, cache_seq_len, num_layers, activation_dim)
+            cache_seq_len = size[1]
+            mask_seq_len = select_mask.shape[1]
+
+            if mask_seq_len != cache_seq_len:
+                print(f"WARNING: Sequence length mismatch: select_mask ({mask_seq_len}) vs cache ({cache_seq_len}). Adjusting select_mask.")
+                if mask_seq_len > cache_seq_len:
+                    select_mask = select_mask[:, :cache_seq_len]
+                    print(f"DEBUG(read_activation): Trimmed select_mask to {select_mask.shape}")
+                elif mask_seq_len < cache_seq_len:
+                    select_mask = torch.cat(
+                        [torch.zeros(select_mask.shape[0], cache_seq_len - mask_seq_len, device=select_mask.device), select_mask],
+                        dim=1
+                    )
+                    print(f"DEBUG(read_activation): Padded select_mask to {select_mask.shape}")
+                
+            extended_select_mask = select_mask[..., None, None].bool().expand_as(stack_cache)
+            
+            cache_select = torch.masked_select(stack_cache, extended_select_mask)
+            if cache_select.numel() == 0:
+                print("WARNING: masked_select resulted in 0 elements. Returning empty tensor.")
+                return torch.empty(0, size[-2], size[-1]) # 올바른 num_layers, activation_dim으로 빈 텐서 반환
+
+            cache_select = cache_select.reshape(-1, size[-2], size[-1])
+            return cache_select
         
 
     def process_prompts(self, model: HookedPreTrainedModel, prompts: list[str], token_type: str):
-        """  convert prompts to input_ids, attention_masks, select_masks(masks for collecting activation)
+        """
+        Convert prompts to input_ids, attention_masks, select_masks (for activation extraction)
 
         Args:
             model: HookedPreTrainedModel
-            prompts: list of input prompt
-            token_type: the token position to be cached (full prompt, prompt last token, completion)
-        
+            prompts: list of input prompts
+            token_type: 'prompt', 'prompt_last', 'completion_last', 'completion_all'
+
         Returns:
-            input_ids: [batch, length]
-            attention_masks: [batch, length]
-            select_masks: [batch, length]
-            
+            input_ids, attention_masks, select_masks
         """
-        assert token_type in ['prompt', 'prompt_last', 'completion'], 'Unsupported token position'
+        assert token_type in ['prompt', 'prompt_last', 'completion_last', 'completion_all'], \
+            f"Unsupported token_type: {token_type}"
+
         batch_input_ids, batch_attention_masks, batch_select_masks = [], [], []
-        if 'prompt' in token_type:
+
+        if token_type in ['prompt', 'prompt_last']:
             for i in tqdm(range(0, len(prompts), self.batchsize), desc="Processing prompts"):
-                batch_prompts = prompts[i: i+self.batchsize]
-                tokenized_prompts = model.to_tokens(batch_prompts, device=model.device)
-                batch_input_ids.append(tokenized_prompts.input_ids)
-                batch_attention_masks.append(tokenized_prompts.attention_mask)
-                if 'last' in token_type:
-                    select_mask = torch.zeros_like(tokenized_prompts.attention_mask)
-                    select_mask[:, -1] = 1
+                batch_prompts = prompts[i: i + self.batchsize]
+                tokenized = model.to_tokens(batch_prompts, device=model.device)
+                batch_input_ids.append(tokenized.input_ids)
+                batch_attention_masks.append(tokenized.attention_mask)
+
+                if token_type == 'prompt_last':
+                    select_mask = torch.zeros_like(tokenized.attention_mask)
+                    select_mask[:, -1] = 1  # 마지막 토큰만
                     batch_select_masks.append(select_mask)
-                else:
-                    batch_select_masks.append(tokenized_prompts.attention_mask)
-        else:
-            batch_input_ids, batch_attention_masks, batch_select_masks = generate_completions_and_masks(
+                else:  # 'prompt'
+                    batch_select_masks.append(tokenized.attention_mask)
+
+        elif token_type in ['completion_last', 'completion_all']:
+            output_ids, attn_masks, gather_masks = generate_completions_and_masks(
                 model,
                 model.tokenizer,
                 prompts,
                 batch_size=self.batchsize,
                 max_new_tokens=self.max_new_tokens,
-                do_sample=False
+                do_sample=False,
             )
+            batch_input_ids.append(output_ids)
+            batch_attention_masks.append(attn_masks)
+
+            if token_type == 'completion_last':
+                # gather_mask 기준으로 마지막 1 위치만 마스크
+                select_mask = torch.zeros_like(gather_masks)
+                for i in range(gather_masks.shape[0]):
+                    nonzero = (gather_masks[i] == 1).nonzero(as_tuple=True)[0]
+                    if len(nonzero) > 0:
+                        select_mask[i, nonzero[-1]] = 1
+                batch_select_masks.append(select_mask)
+            else:  # 'completion_all'
+                batch_select_masks.append(gather_masks)
+
         return batch_input_ids, batch_attention_masks, batch_select_masks
-                
+
+
     def _get_activation(self,
-                        model: HookedPreTrainedModel,
-                        batch_input_ids: torch.Tensor,
-                        batch_attention_masks: torch.Tensor,
-                        batch_select_masks: torch.Tensor,
-                        names_filter: Callable = lambda name: name.endswith('hook_post')
-                        ):
-        """  
-        get activation from processed input, useful in ActivationContrasting
-        
-        """ 
+                         model: HookedPreTrainedModel,
+                         batch_input_ids: torch.Tensor,
+                         batch_attention_masks: torch.Tensor,
+                         batch_select_masks: torch.Tensor,
+                         names_filter: Callable = lambda name: name.endswith('hook_post')
+                         ):
         device = model.device
         activation = []
         for input_ids, attention_mask, select_mask in tqdm(zip(batch_input_ids, batch_attention_masks, batch_select_masks), desc="Getting Activations", total=len(batch_input_ids)):
@@ -105,34 +140,41 @@ class BaseActivationProcessor:
             attention_mask = attention_mask.to(device)
             select_mask = select_mask.to(device)
             _, cache = model.run_with_cache(input_ids=input_ids, attention_mask=attention_mask, names_filter=names_filter)
+
             batch_activation = self.read_activation_from_cache(cache, select_mask)
             activation.append(batch_activation)
-        return torch.concat(activation, dim=0)
-    
-    def get_activation(self,
-                       model,
-                       prompts: list[str],
-                       names_filter,
-                       token_type: str = 'completion'
-                       ):
+        
+        if activation:
+            final_activation = torch.concat(activation, dim=0)
+            return final_activation
+        else:
+            return torch.tensor([]) # 또는 적절한 빈 텐서 반환
 
-        """  get specific activation on given prompts
+    def get_activation(self,
+                    model,
+                    prompts: list[str],
+                    names_filter: Callable = lambda name: name.startswith('model.layers.') and name.endswith('mlp.hook_post'),
+                    token_type: str = 'completion_all'  # 기본값 수정
+                    ):
+        """
+        Get specific activation on given prompts
 
         Args:
             model: HookedPreTrainedModel
             prompts: list of input prompt
             names_filter: the type of activations (e.g. mlp, attn, etc) to be cached
-            token_type: the token position to be cached (full prompt, prompt last token, completion)
-        
+            token_type: the token position to be cached ('prompt', 'prompt_last', 'completion_last', 'completion_all')
+
         Returns:
             activation: [batch, tokens, activation dims]
         """
         batch_input_ids, batch_attention_masks, batch_select_masks = self.process_prompts(model, prompts, token_type)
         return self._get_activation(model, batch_input_ids, batch_attention_masks, batch_select_masks, names_filter)
 
+
     
 class ActivationContrasting(BaseActivationProcessor):
-    def __init__(self, base_model_name_or_path: str, first_model_name_or_path: list[str], second_model_name_or_path: list[str], batchsize=20, max_new_tokens=128, **load_parameter) -> None:
+    def __init__(self, base_model_name_or_path: str, first_model_name_or_path: list[str], second_model_name_or_path: list[str], batchsize=12, max_new_tokens=200, **load_parameter) -> None:
         """  
         Args:
             base_model_name_or_path: the same as model_name_or_path in huggingface transformers
@@ -150,7 +192,7 @@ class ActivationContrasting(BaseActivationProcessor):
     
     def compute_change_scores(self,
                               prompts: list[str],
-                              names_filter: Callable = lambda name: name.endswith('hook_post'),
+                              names_filter: Callable = lambda name: name.startswith('model.layers.') and name.endswith('mlp.hook_post'),
                               token_type: str = 'completion'):
         """  compute change scores on given prompts
 
@@ -170,7 +212,6 @@ class ActivationContrasting(BaseActivationProcessor):
         hooked_model, tokenizer = load_hooked_lm_and_tokenizer(
             model_name_or_path=self.second_model_name_or_path,#
             tokenizer_name_or_path=self.base_model_name_or_path,
-            # peft_name_or_path=self.second_peft_path,
             **self.load_parameter
         )
         hooked_model.set_tokenizer(tokenizer)
@@ -203,7 +244,6 @@ class ActivationContrasting(BaseActivationProcessor):
         del hooked_model, tokenizer
         torch.cuda.empty_cache()
 
-        print(f'Get neuron activation on {second_activation.shape[0]} tokens')
         change_scores = self.metric(first_activation, second_activation)
         first_mean = first_activation.mean(0)
         second_mean = second_activation.mean(0)
@@ -229,7 +269,7 @@ class ActivationContrasting(BaseActivationProcessor):
     
 
 class NeuronActivation(BaseActivationProcessor):
-    def __init__(self, base_model_name_or_path: str, score_model_name_or_path: str, peft_path: list[str], neuron_ranks: list[torch.Tensor] = None, batchsize=20, max_new_tokens=128, **load_parameter) -> None:
+    def __init__(self, base_model_name_or_path: str, score_model_name_or_path: str, peft_path: list[str], neuron_ranks: list[torch.Tensor] = None, batchsize=12, max_new_tokens=200, **load_parameter) -> None:
         """  
         Args:
             base_model_name_or_path: the same as model_name_or_path in huggingface transformers
@@ -273,7 +313,7 @@ class NeuronActivation(BaseActivationProcessor):
             **self.load_parameter
         )
         hooked_model.set_tokenizer(tokenizer)
-        names_filter = lambda name: name.endswith('hook_post')
+        names_filter = lambda name: name.startswith('model.layers.') and name.endswith('mlp.hook_post')
         activation = self.get_activation(hooked_model, prompts, names_filter, token_type='prompt_last')
         activations = []
         for rank in self.ranks:

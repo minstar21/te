@@ -7,12 +7,11 @@ import os
 from importlib import import_module
 from collections import defaultdict
 from functools import partial
-from transformers import StoppingCriteria
+from transformers import StoppingCriteria, AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
-from contamination import GSM8K, GSM_HARD, MATH, ARC, TruthfulQA, asdiv, SVAMP, THEOREM_QA, MAWPS, TABMWP, MMLU
-from src.training.finetune import encode_with_prompt_completion_format
+#from contamination import GSM8K, GSM_HARD, MATH, ARC, TruthfulQA, asdiv, SVAMP, THEOREM_QA, MAWPS, TABMWP, MMLU
+#from src.training.finetune import encode_with_prompt_completion_format
 from src.eval.dispatch_openai_requests import dispatch_openai_chat_requesets, dispatch_openai_prompt_requesets
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from peft.peft_model import PeftModel
 from src.models.HookedLlama import HookedLlamaForCausalLM
 from src.models.HookedMistral import HookedMistralForCausalLM
@@ -44,366 +43,295 @@ class KeyWordsCriteria(StoppingCriteria):
             sequences_should_be_stopped.append(sequence_should_be_stopped)
         return torch.tensor(sequences_should_be_stopped, device=input_ids.device)
     
-    
+
 @torch.no_grad()
-def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequences=None, add_special_tokens=True, disable_tqdm=False, **generation_kwargs):
+def generate_completions(
+    model, tokenizer, prompts,
+    guided_model=None, index=None, hook_fn=None,
+    batch_size=1, stop_id_sequences=None,
+    max_new_tokens=200, add_special_tokens=True,
+    disable_tqdm=False, tqdm_desc=None, **generation_kwargs
+):
+    """
+    Step-wise dynamic activation patching during generation:
+      - At each token step, cache activations from guided_model,
+      - inject into model via hooks,
+      - then predict next token.
+    """
+    from collections import defaultdict
+    from functools import partial
+    from src.utils import get_act_name
+
     generations = []
     if not disable_tqdm:
-        progress = tqdm.tqdm(total=len(prompts), desc="Generating Completions")
-    # breakpoint()
-    num_return_sequences = generation_kwargs.get("num_return_sequences", 1)
+        desc = tqdm_desc or "Generating Completions"
+        progress = tqdm.tqdm(total=len(prompts), desc=desc)
+
     for i in range(0, len(prompts), batch_size):
-        batch_prompts = prompts[i:i+batch_size]
-        tokenized_prompts = tokenizer(batch_prompts, padding="longest", return_tensors="pt", add_special_tokens=add_special_tokens)
-        batch_input_ids = tokenized_prompts.input_ids
-        attention_mask = tokenized_prompts.attention_mask
+        batch = prompts[i:i + batch_size]
+        tok = tokenizer(batch, return_tensors="pt", padding=True,
+                        add_special_tokens=add_special_tokens)
+        input_ids = tok.input_ids.cuda()
+        attention_mask = tok.attention_mask.cuda()
 
-        if model.device.type == "cuda":
-            batch_input_ids = batch_input_ids.cuda()
-            attention_mask = attention_mask.cuda()
+        # reset hooks before starting sequence
+        model.reset_hooks(including_permanent=True)
 
-        # try:
-            batch_outputs = model.generate(
-                input_ids=batch_input_ids,
-                attention_mask=attention_mask,
-                stopping_criteria=[KeyWordsCriteria(stop_id_sequences)] if stop_id_sequences else None,
-                **generation_kwargs
-            )
-        
-            # the stopping criteria is applied at batch level, so if other examples are not stopped, the entire batch will continue to generate.
-            # so some outputs still have the stop sequence, which we need to remove.
-            if stop_id_sequences:
-                for output_idx in range(batch_outputs.shape[0]):
-                    for token_idx in range(batch_input_ids.shape[1], batch_outputs.shape[1]):
-                        if any(batch_outputs[output_idx, token_idx: token_idx+len(stop_sequence)].tolist() == stop_sequence for stop_sequence in stop_id_sequences):
-                            batch_outputs[output_idx, token_idx:] = tokenizer.pad_token_id
-                            break
+        finished = torch.zeros(input_ids.size(0), dtype=torch.bool, device=input_ids.device)
+        generated = [[] for _ in range(input_ids.size(0))]
 
-            # remove the prompt from the output
-            # we need to re-encode the prompt because we need to make sure the special tokens are treated the same way as in the outputs.
-            # we changed our previous way of truncating the output token ids dicrectly because some tokenizer (e.g., llama) won't add space token before the first token.
-            # space is important for some tasks (e.g., code completion).
-            batch_outputs = tokenizer.batch_decode(batch_outputs, skip_special_tokens=True)
-            batch_prompts = tokenizer.batch_decode(batch_input_ids, skip_special_tokens=True)
-            # duplicate the prompts to match the number of return sequences
-            batch_prompts = [prompt for prompt in batch_prompts for _ in range(num_return_sequences)]
-            batch_generations = [
-                output[len(prompt):] for prompt, output in zip(batch_prompts, batch_outputs)
-            ]
-        # except Exception as e:
-        #     print("Error when generating completions for batch:")
-        #     breakpoint()
-        #     # print(batch_prompts)
-        #     print("Error message:")
-        #     print(e)
-        #     print("Use empty string as the completion.")
-        #     batch_generations = [""] * len(batch_prompts) * num_return_sequences
+        for step in range(max_new_tokens):
+            # apply patch only if fully specified and non-empty
+            if guided_model is not None and index and hook_fn is not None:
+                _, cache = guided_model.run_with_cache(
+                    input_ids, attention_mask,
+                    names_filter=lambda n: n.endswith("hook_post")
+                )
+                layers = defaultdict(list)
+                for layer_idx, neuron_idx in index:
+                    layers[int(layer_idx)].append(int(neuron_idx))
+                model.reset_hooks(including_permanent=True)
+                for layer_idx, neurons in layers.items():
+                    act = cache["post", layer_idx]
+                    neurons_t = torch.tensor(neurons, device=act.device)
+                    patched_vals = act[..., neurons_t]
+                    model.add_perma_hook(
+                        get_act_name("post", layer_idx),
+                        partial(hook_fn, neurons=neurons_t, patched_values=patched_vals)
+                    )
 
-        generations += batch_generations
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1)
 
-        # for prompt, generation in zip(batch_prompts, batch_generations):
-        #     print("========")
-        #     print(prompt)
-        #     print("--------")
-        #     print(generation)
+            input_ids = torch.cat([input_ids, next_token.unsqueeze(-1)], dim=1)
+            attention_mask = torch.cat(
+                [attention_mask, torch.ones_like(next_token).unsqueeze(-1)], dim=1)
 
+            for b in range(input_ids.size(0)):
+                if not finished[b]:
+                    generated[b].append(next_token[b].item())
+                    for stop_seq in (stop_id_sequences or []):
+                        if (len(generated[b]) >= len(stop_seq) and
+                            generated[b][-len(stop_seq):] == stop_seq):
+                            finished[b] = True
+            if finished.all():
+                break
+
+        decoded = tokenizer.batch_decode(generated, skip_special_tokens=True)
+        generations.extend(decoded)
         if not disable_tqdm:
-            progress.update(len(batch_prompts)//num_return_sequences)
+            progress.update(len(decoded))
 
-    assert len(generations) == len(prompts) * num_return_sequences, "number of generations should be equal to number of prompts * num_return_sequences"
     return generations
 
+'''        
 @torch.no_grad()
-def generate_completions_and_scores(model, tokenizer, eval_data, prompts, test_dataset, reward_model=None, reward_tokenizer=None, cost_model=None, cost_tokenizer=None, batch_size=1, stop_id_sequences=None, add_special_tokens=True, disable_tqdm=False, return_mask=False, **generation_kwargs):
-    tasks = {
-        'gsm8k': GSM8K(),
-        'truthfulqa': TruthfulQA(),
-        'arc': ARC(),
-        'mmlu': MMLU(),
-    }
-    task = tasks.get(test_dataset, None)
-    
-    def prompt_template(instruction, input_):
-        if len(instruction) == 0:
-            return f'### Input:\n{input_}\n\n### Response:\n'
-        return f'### Instruction:\n{instruction}\n\n### Input:\n{input_}\n\n### Response:\n'
+def generate_completions(model, tokenizer, prompts, guided_model=None, index=None, hook_fn=None,
+                         batch_size=1, stop_id_sequences=None, max_new_tokens=128,
+                         add_special_tokens=True, disable_tqdm=False, **generation_kwargs):
+    from collections import defaultdict
+    from functools import partial
+    from src.utils import get_act_name
 
-    def generation_prompt_template(input_):
-        return f'### Input:\n{input_}\n\n### Response:\n'
-    
-    def get_reward(model, input_ids, attention_mask):
-        rewards = []
-        if isinstance(model, LlamaRewardModel):
-            rewards = model(input_ids=input_ids, attention_mask=attention_mask).tolist()
-        if isinstance(model, LlamaModelForScore):
-            rewards = model(input_ids=input_ids, attention_mask=attention_mask).end_scores.squeeze(dim=-1).tolist()
-        return rewards
-        
     generations = []
-    cost_scores = []
-    reward_scores = []
-    math_scores = []
-    masks = []
-    math_score_sum = 0
     if not disable_tqdm:
-        progress = tqdm.tqdm(total=len(prompts), desc="Generating Completions")
+        progress = tqdm.tqdm(total=len(prompts), desc=generation_kwargs.get("tqdm_desc", "Generating Completions"))
 
-    num_return_sequences = generation_kwargs.get("num_return_sequences", 1)
-    # for i in range(0, len(prompts), batch_size):
-    i = 0
-    for example in eval_data:
-        # batch_prompts = prompts[i:i+batch_size]
-        prompt = generation_prompt_template(example["question"])
-        tokenized_prompts = tokenizer(prompt, padding="longest", return_tensors="pt", add_special_tokens=add_special_tokens)
-        input_ids = tokenized_prompts.input_ids
-        attention_mask = tokenized_prompts.attention_mask
+    for i in range(0, len(prompts), batch_size):
+        batch_prompts = prompts[i:i + batch_size]
+        tokenized = tokenizer(batch_prompts, return_tensors="pt", padding=True,
+                              add_special_tokens=add_special_tokens)
+        input_ids = tokenized.input_ids.cuda()
+        attention_mask = tokenized.attention_mask.cuda()
 
-        if model.device.type == "cuda":
-            input_ids = input_ids.to(model.device)
-            attention_mask = attention_mask.to(model.device)
+        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool).to(input_ids.device)
+        generated = [[] for _ in range(input_ids.shape[0])]
 
-        try:
-            
-            output = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                stopping_criteria=[KeyWordsCriteria(stop_id_sequences)] if stop_id_sequences else None,
-                **generation_kwargs
-            )
-            if return_mask:
-                masks.append(output[:, input_ids.shape[1]:] != 0)  #修改过
-            # the stopping criteria is applied at batch level, so if other examples are not stopped, the entire batch will continue to generate.
-            # so some outputs still have the stop sequence, which we need to remove.
-            if stop_id_sequences:
-                for output_idx in range(output.shape[0]):
-                    for token_idx in range(input_ids.shape[1], output.shape[1]):
-                        if any(output[output_idx, token_idx: token_idx+len(stop_sequence)].tolist() == stop_sequence for stop_sequence in stop_id_sequences):
-                            output[output_idx, token_idx:] = tokenizer.pad_token_id
-                            break
-            # breakpoint()
-            # remove the prompt from the output
-            # we need to re-encode the prompt because we need to make sure the special tokens are treated the same way as in the outputs.
-            # we changed our previous way of truncating the output token ids dicrectly because some tokenizer (e.g., llama) won't add space token before the first token.
-            # space is important for some tasks (e.g., code completion).
-            output = tokenizer.batch_decode(output, skip_special_tokens=True)
-            # output = ['<|user|>'.join(output.split('<|user|>')[:2])]
-            prompt = tokenizer.batch_decode(input_ids, skip_special_tokens=True)
-            # duplicate the prompts to match the number of return sequences
-            # batch_prompts = [prompt for prompt in batch_prompts for _ in range(num_return_sequences)]
-            batch_generations = [
-                output[0][len(prompt[0]):]# for prompt, output in zip(batch_prompts, outputs)
-            ]
-            # score model output with reward and cost models
-            if cost_model and cost_tokenizer:
-                cost_tokenized_prompts = cost_tokenizer(output, padding="longest", return_tensors="pt", add_special_tokens=add_special_tokens)
-                cost_batch_input_ids = cost_tokenized_prompts.input_ids
-                cost_attention_mask = cost_tokenized_prompts.attention_mask     
-                if cost_model.device.type == "cuda":
-                    cost_batch_input_ids = cost_batch_input_ids.to(cost_model.device)
-                    cost_attention_mask = cost_attention_mask.to(cost_model.device)
-                cost_score = get_reward(cost_model, cost_batch_input_ids, attention_mask=cost_attention_mask)
-            if reward_model and reward_tokenizer:
-                reward_tokenized_prompts = reward_tokenizer(output, padding="longest", return_tensors="pt", add_special_tokens=add_special_tokens)
-                reward_batch_input_ids = reward_tokenized_prompts.input_ids
-                reward_attention_mask = reward_tokenized_prompts.attention_mask     
-                if reward_model.device.type == "cuda":
-                    reward_batch_input_ids = reward_batch_input_ids.to(reward_model.device)
-                    reward_attention_mask = reward_attention_mask.to(reward_model.device)
-                reward_score = get_reward(reward_model, reward_batch_input_ids, attention_mask=reward_attention_mask)
-            
-            # score model output on math dataset with accuracy
-            output = output[0][len(prompt[0]):]
-            generated_answer = task.parse_answer(output)
-            correct_answer = task.parse_answer(example['answer'])
-            if correct_answer == generated_answer:
-                math_score = [1]
-                math_score_sum += 1
-            else :
-                math_score = [0]
-            # breakpoint()
-        except Exception as e:
-            print("Error when generating completions for batch:")
-            print(prompt)
-            print("Error message:")
-            print(e)
-            print("Use empty string as the completion.")
-            batch_generations = [""] * num_return_sequences
-            cost_scores = [0] * num_return_sequences
-            reward_scores = [0] * num_return_sequences
-            math_scores = [0] * num_return_sequences
-        
-        generations += batch_generations
-        if cost_model:
-            cost_scores += cost_score
-        else :
-            cost_scores += [0]
-        if reward_model:
-            reward_scores += reward_score
-        else :
-            reward_scores += [0]
-        math_scores += math_score
+        for _ in range(max_new_tokens):
+            # 1. Add hooks from guided_model at every step
+            if guided_model and index is not None:
+                _, cache = guided_model.run_with_cache(input_ids, attention_mask,
+                                                       names_filter=lambda n: n.endswith("hook_post"))
+                layers = defaultdict(list)
+                for layer, idx in index:
+                    layers[layer.item()].append(idx)
+                model.reset_hooks(including_permanent=True)
+                for layer, neurons in layers.items():
+                    layer_cache = cache["post", layer]
+                    neurons_tensor = torch.tensor(neurons).to(layer_cache.device)
+                    patched_values = layer_cache[..., neurons_tensor]
+                    model.add_perma_hook(
+                        get_act_name("post", layer),
+                        partial(hook_fn, neurons=neurons_tensor, patched_values=patched_values)
+                    )
+
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            next_token_logits = outputs.logits[:, -1, :]
+            next_token = torch.argmax(next_token_logits, dim=-1)
+
+            input_ids = torch.cat([input_ids, next_token.unsqueeze(-1)], dim=1)
+            attention_mask = torch.cat([attention_mask, torch.ones_like(next_token).unsqueeze(-1)], dim=1)
+
+            for b in range(input_ids.shape[0]):
+                if not finished[b]:
+                    generated[b].append(next_token[b].item())
+                    for stop_seq in (stop_id_sequences or []):
+                        if len(generated[b]) >= len(stop_seq) and \
+                                generated[b][-len(stop_seq):] == stop_seq:
+                            finished[b] = True
+            if finished.all():
+                break
+
+        decoded = tokenizer.batch_decode(generated, skip_special_tokens=True)
+        generations += decoded
         if not disable_tqdm:
-            progress.update(1//num_return_sequences)
-    # for i in range(0, len(prompts), batch_size):
-    #     batch_prompts = prompts[i:i+batch_size]
-    #     tokenized_prompts = tokenizer(batch_prompts, padding="longest", return_tensors="pt", add_special_tokens=add_special_tokens)
-    #     batch_input_ids = tokenized_prompts.input_ids
-    #     attention_mask = tokenized_prompts.attention_mask
+            progress.update(len(decoded))
 
-    #     if model.device.type == "cuda":
-    #         batch_input_ids = batch_input_ids.to(model.device)
-    #         attention_mask = attention_mask.to(model.device)
-
-    #     try:
-    #         # breakpoint()
-    #         batch_outputs = model.generate(
-    #             input_ids=batch_input_ids,
-    #             attention_mask=attention_mask,
-    #             stopping_criteria=[KeyWordsCriteria(stop_id_sequences)] if stop_id_sequences else None,
-    #             **generation_kwargs
-    #         )
-    #         if return_mask:
-    #             masks.append(batch_outputs[:, batch_input_ids.shape[1]:] != 0)
-    #         # the stopping criteria is applied at batch level, so if other examples are not stopped, the entire batch will continue to generate.
-    #         # so some outputs still have the stop sequence, which we need to remove.
-    #         if stop_id_sequences:
-    #             for output_idx in range(batch_outputs.shape[0]):
-    #                 for token_idx in range(batch_input_ids.shape[1], batch_outputs.shape[1]):
-    #                     if any(batch_outputs[output_idx, token_idx: token_idx+len(stop_sequence)].tolist() == stop_sequence for stop_sequence in stop_id_sequences):
-    #                         batch_outputs[output_idx, token_idx:] = tokenizer.pad_token_id
-    #                         break
-            
-    #         # remove the prompt from the output
-    #         # we need to re-encode the prompt because we need to make sure the special tokens are treated the same way as in the outputs.
-    #         # we changed our previous way of truncating the output token ids dicrectly because some tokenizer (e.g., llama) won't add space token before the first token.
-    #         # space is important for some tasks (e.g., code completion).
-    #         batch_outputs = tokenizer.batch_decode(batch_outputs, skip_special_tokens=True)
-    #         batch_outputs = ['<|user|>'.join(output.split('<|user|>')[:2]) for output in batch_outputs]
-    #         batch_prompts = tokenizer.batch_decode(batch_input_ids, skip_special_tokens=True)
-    #         # duplicate the prompts to match the number of return sequences
-    #         batch_prompts = [prompt for prompt in batch_prompts for _ in range(num_return_sequences)]
-    #         batch_generations = [
-    #             output[len(prompt):] for prompt, output in zip(batch_prompts, batch_outputs)
-    #         ]
-
-    #         # score model output with reward and cost models
-    #         if cost_model and cost_tokenizer:
-    #             cost_tokenized_prompts = cost_tokenizer(batch_outputs, padding="longest", return_tensors="pt", add_special_tokens=add_special_tokens)
-    #             cost_batch_input_ids = cost_tokenized_prompts.input_ids
-    #             cost_attention_mask = cost_tokenized_prompts.attention_mask     
-    #             if cost_model.device.type == "cuda":
-    #                 cost_batch_input_ids = cost_batch_input_ids.to(cost_model.device)
-    #                 cost_attention_mask = cost_attention_mask.to(cost_model.device)
-    #             cost_score = get_reward(cost_model, cost_batch_input_ids, attention_mask=cost_attention_mask)
-    #         if reward_model and reward_tokenizer:
-    #             reward_tokenized_prompts = reward_tokenizer(batch_outputs, padding="longest", return_tensors="pt", add_special_tokens=add_special_tokens)
-    #             reward_batch_input_ids = reward_tokenized_prompts.input_ids
-    #             reward_attention_mask = reward_tokenized_prompts.attention_mask     
-    #             if reward_model.device.type == "cuda":
-    #                 reward_batch_input_ids = reward_batch_input_ids.to(reward_model.device)
-    #                 reward_attention_mask = reward_attention_mask.to(reward_model.device)
-    #             reward_score = get_reward(reward_model, reward_batch_input_ids, attention_mask=reward_attention_mask)
-                
-    #         # score model output on math dataset with accuracy
-            
-
-    #     except Exception as e:
-    #         print("Error when generating completions for batch:")
-    #         print(batch_prompts)
-    #         print("Error message:")
-    #         print(e)
-    #         print("Use empty string as the completion.")
-    #         batch_generations = [""] * len(batch_prompts) * num_return_sequences
-    #         cost_scores = [0] * len(batch_prompts) * num_return_sequences
-    #         reward_scores = [0] * len(batch_prompts) * num_return_sequences
-
-    #     generations += batch_generations
-    #     if cost_model:
-    #         cost_scores += cost_score
-    #     if reward_model:
-    #         reward_scores += reward_score
-
-    #     if not disable_tqdm:
-    #         progress.update(len(batch_prompts)//num_return_sequences)
-    # breakpoint()
-    # assert len(generations) == len(prompts) * num_return_sequences, "number of generations should be equal to number of prompts * num_return_sequences"
-    if return_mask:
-        masks = torch.cat(masks, 0).detach().cpu()
-    return generations, math_scores, cost_scores, reward_scores, masks
+    return generations
+'''
 
 @torch.no_grad()
-def generate_completions_and_masks(model, tokenizer, prompts, batch_size=1, add_special_tokens=True, disable_tqdm=False, **generation_kwargs):
-    outputs = []
-    attention_masks = []
-    gather_masks = []
+def generate_completions_and_masks(
+    model, tokenizer, prompts,
+    batch_size=1, add_special_tokens=True, disable_tqdm=False,
+    **generation_kwargs,
+):
+    all_output_ids, all_attention_masks, all_gather_masks = [], [], []
+
     if not disable_tqdm:
         progress = tqdm.tqdm(total=len(prompts), desc="Generating Completions")
 
     num_return_sequences = generation_kwargs.get("num_return_sequences", 1)
-    for i in range(0, len(prompts), batch_size):
-        batch_prompts = prompts[i:i+batch_size]
-        tokenized_prompts = tokenizer(batch_prompts, padding="longest", return_tensors="pt", add_special_tokens=add_special_tokens)
-        batch_input_ids = tokenized_prompts.input_ids
-        attention_mask = tokenized_prompts.attention_mask
 
+    # 토크나이저의 pad_token_id 설정 확인
+    if tokenizer.pad_token_id is None:
+        # 대부분의 LLM 토크나이저는 pad_token_id가 없으면 eos_token_id를 사용하도록 권장합니다.
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        # print("WARNING: Tokenizer pad_token_id is None. Setting it to eos_token_id for padding.")
+
+    for i in range(0, len(prompts), batch_size):
+        batch_prompts = prompts[i : i + batch_size]
+        
+        # 프롬프트를 토큰화합니다. 이때 attention_mask도 함께 얻습니다.
+        tok = tokenizer(
+            batch_prompts,
+            padding="longest",
+            return_tensors="pt",
+            add_special_tokens=add_special_tokens,
+        )
+        batch_input_ids, batch_attn = tok.input_ids, tok.attention_mask
+        
         if model.device.type == "cuda":
-            batch_input_ids = batch_input_ids.to(model.device)
-            attention_mask = attention_mask.to(model.device)
+            batch_input_ids, batch_attn = batch_input_ids.to(model.device), batch_attn.to(model.device)
 
         try:
-            batch_outputs_ids = model.generate(
+            # --- model.generate 호출 ---
+            batch_out_raw = model.generate( # raw 결과를 받습니다.
                 input_ids=batch_input_ids,
-                attention_mask=attention_mask,
-                **generation_kwargs
+                attention_mask=batch_attn,
+                **generation_kwargs,
             )
-
-            # remove the prompt from the output
-            # we need to re-encode the prompt because we need to make sure the special tokens are treated the same way as in the outputs.
-            # we changed our previous way of truncating the output token ids dicrectly because some tokenizer (e.g., llama) won't add space token before the first token.
-            # space is important for some tasks (e.g., code completion).
-            batch_outputs = tokenizer.batch_decode(batch_outputs_ids, skip_special_tokens=True)
-            batch_prompts = tokenizer.batch_decode(batch_input_ids, skip_special_tokens=True)
-            # duplicate the prompts to match the number of return sequences
-            batch_prompts = [prompt for prompt in batch_prompts for _ in range(num_return_sequences)]
-            batch_generations = [
-                output[len(prompt):] for prompt, output in zip(batch_prompts, batch_outputs)
-            ]
-            # breakpoint()
-            batch_ids = []
-            batch_attention_mask = []
-            batch_gather_mask = []
-            max_length = -1
-            for prompt, output in zip(batch_prompts, batch_generations):
-                prompt_ids = tokenizer(prompt, add_special_tokens=add_special_tokens).input_ids
-                output_ids = tokenizer(output, add_special_tokens=False).input_ids
-                ids = prompt_ids + output_ids
-                max_length = max(len(ids), max_length)
-                batch_ids.append(ids)
-                batch_attention_mask.append([1]*len(ids))
-                batch_gather_mask.append([1]*len(output_ids))
-                
-            batch_ids = [[tokenizer.pad_token_id]*(max_length-len(ids)) + ids for ids in batch_ids]
-            batch_attention_mask = [[0]*(max_length-len(mask)) + mask for mask in batch_attention_mask]
-            batch_gather_mask = [[0]*(max_length-len(mask)) + mask for mask in batch_gather_mask]
             
-        except Exception as e:
-            print("Error when generating completions for batch:")
-            print(batch_prompts)
-            print("Error message:")
-            print(e)
-            print("Use empty string as the completion.")
-            batch_ids = batch_prompts * num_return_sequences
+            # model.generate의 반환 값 처리 (핵심 변경)
+            # GenerateOutput 객체라면 .sequences 속성을 사용합니다.
+            if hasattr(batch_out_raw, 'sequences') and isinstance(batch_out_raw.sequences, torch.Tensor):
+                batch_out_ids = batch_out_raw.sequences
+            elif isinstance(batch_out_raw, torch.Tensor):
+                batch_out_ids = batch_out_raw
+            else:
+                # 예상치 못한 타입이라면 오류를 발생시키거나 빈 텐서를 처리할 수 있습니다.
+                print(f"ERROR: Unexpected type returned by model.generate: {type(batch_out_raw)}. Expected a Tensor or an object with .sequences attribute.")
+                raise TypeError(f"model.generate returned unexpected type: {type(batch_out_raw)}")
 
-        outputs.append(torch.tensor(batch_ids))
-        attention_masks.append(torch.tensor(batch_attention_mask))
-        gather_masks.append(torch.tensor(batch_gather_mask))
+            # --- 디버깅 출력 추가 ---
+            print(f"\nDEBUG(generate_completions_and_masks): After model.generate, batch_out_ids shape: {batch_out_ids.shape}")
+            # --- 디버깅 출력 끝 ---
+
+            # 각 시퀀스별로 gather_mask (select_mask) 생성
+            for j in range(batch_out_ids.shape[0]):
+                current_prompt_input_ids = batch_input_ids[j] # 현재 배치 아이템의 원본 프롬프트 input_ids
+                current_output_ids = batch_out_ids[j] # 현재 배치 아이템의 모델 생성 전체 output_ids
+
+                # 원본 프롬프트의 실제 길이를 계산합니다 (패딩 토큰 제외).
+                # `original_prompt_len`은 모델이 생성하기 시작한 지점의 인덱스가 됩니다.
+                original_prompt_len = (current_prompt_input_ids != tokenizer.pad_token_id).sum().item()
+                
+                # gather_mask 초기화: 모든 토큰을 0 (마스킹하지 않음)으로 설정
+                gather_mask = torch.zeros_like(current_output_ids, dtype=torch.long)
+                
+                # 새로 생성된 토큰이 있다면 해당 부분에 1을 설정합니다.
+                # `model.generate`는 기본적으로 입력 `input_ids`를 결과 `output_ids`에 포함하여 반환합니다.
+                # 따라서 `original_prompt_len` 이후부터가 생성된 토큰입니다.
+                if current_output_ids.shape[0] > original_prompt_len:
+                    gather_mask[original_prompt_len:] = 1
+                
+                # --- 디버깅 출력 추가 ---
+                # print(f"\nDEBUG(generate_completions_and_masks - loop {j}):")
+                # print(f"  original_prompt_len (actual tokens in input_ids): {original_prompt_len}")
+                # print(f"  current_output_ids shape: {current_output_ids.shape}")
+                # # print(f"  gather_mask (before append): {gather_mask}") # 모든 마스크를 출력하면 너무 길 수 있습니다.
+                print(f"  gather_mask sum (before append): {gather_mask.sum().item()}") # 1의 개수만 확인
+                # --- 디버깅 출력 끝 ---
+
+                all_output_ids.append(current_output_ids)
+                # 생성된 시퀀스 전체에 대해 어텐션 마스크는 1로 설정합니다 (모든 토큰 유효).
+                all_attention_masks.append(torch.ones_like(current_output_ids, dtype=torch.long)) 
+                all_gather_masks.append(gather_mask)
+
+        except Exception as e:
+            print("Error when generating completions for batch:\n", batch_prompts)
+            print("Error message:\n", e, "\nUsing prompts 그대로 토큰화하여 패딩합니다.")
+            
+            # 오류 발생 시: 원래 프롬프트만 토큰화하고 gather_mask는 모두 0으로 만듭니다.
+            enc = tokenizer(batch_prompts, return_tensors="pt", padding=True, add_special_tokens=add_special_tokens)
+            for j in range(enc["input_ids"].shape[0]):
+                all_output_ids.append(enc["input_ids"][j])
+                all_attention_masks.append(enc["attention_mask"][j])
+                all_gather_masks.append(torch.zeros_like(enc["input_ids"][j], dtype=torch.long))
 
         if not disable_tqdm:
-            progress.update(len(batch_prompts)//num_return_sequences)
+            progress.update(len(batch_prompts)) 
 
-    # tokenized_generations = tokenizer(generations, padding="longest", return_tensors="pt", add_special_tokens=False)
-    # assert len(outputs) == len(prompts) * num_return_sequences, "number of generations should be equal to number of prompts * num_return_sequences"
-    return outputs, attention_masks, gather_masks
+    # 리스트에 있는 텐서들을 가장 긴 시퀀스 길이에 맞춰 패딩하고 스택합니다.
+    if not all_output_ids: # 리스트가 비어있으면 빈 텐서 반환
+        return torch.tensor([]), torch.tensor([]), torch.tensor([])
+
+    max_len_output = max([ids.shape[0] for ids in all_output_ids])
+    
+    padded_output_ids = []
+    padded_attention_masks = []
+    padded_gather_masks = []
+
+    for ids, attn_mask, gather_mask in zip(all_output_ids, all_attention_masks, all_gather_masks):
+        padding_length = max_len_output - ids.shape[0]
+        
+        # 왼쪽에 패딩을 추가합니다.
+        padded_output_ids.append(
+            torch.cat([torch.full((padding_length,), tokenizer.pad_token_id, dtype=ids.dtype, device=ids.device), ids])
+        )
+        padded_attention_masks.append(
+            torch.cat([torch.zeros(padding_length, dtype=attn_mask.dtype, device=attn_mask.device), attn_mask])
+        )
+        padded_gather_masks.append(
+            torch.cat([torch.zeros(padding_length, dtype=gather_mask.dtype, device=gather_mask.device), gather_mask])
+        )
+    
+    # --- 최종 반환 전 디버깅 출력 ---
+    print(f"\nDEBUG(generate_completions_and_masks): Before final stack:")
+    for j, ids_tensor in enumerate(padded_output_ids):
+        print(f"  padded_output_ids[{j}] shape: {ids_tensor.shape}")
+    print(f"  Length of padded_output_ids list: {len(padded_output_ids)}")
+    print(f"  Shape of final stacked output_ids: {torch.stack(padded_output_ids).shape}")
+    print(f"  Shape of final stacked gather_masks: {torch.stack(padded_gather_masks).shape}")
+    # --- 디버깅 출력 끝 ---
+
+    return (
+        torch.stack(padded_output_ids),
+        torch.stack(padded_attention_masks),
+        torch.stack(padded_gather_masks)
+    )
+
+
 
 @torch.no_grad()
 def get_next_word_predictions(model, tokenizer, prompts, candidate_token_ids=None, batch_size=1, return_token_predictions=False, add_special_tokens=True, disable_tqdm=False):
@@ -553,49 +481,46 @@ def score_completions(model, tokenizer, scoring_examples, disable_tqdm=False):
 
 
 def load_hooked_lm_and_tokenizer(
-        model_name_or_path, 
+        model_name_or_path,
         peft_name_or_path=None,
-        tokenizer_name_or_path=None, 
-        device_map="auto", 
+        tokenizer_name_or_path=None,
+        device_map="auto",
         torch_dtype="auto",
-        load_in_8bit=False, 
+        load_in_8bit=False,
         convert_to_half=False,
         use_fast_tokenizer=True,
         padding_side="left"
     ):
     # breakpoint()
-    config = json.load(open(os.path.join(model_name_or_path, 'config.json')))
-    model_cls = AUTO_MODEL_MAPPING[config['model_type']]
-    
+
+    # config를 직접 파일에서 읽는 대신 AutoConfig를 사용하여 Hugging Face Hub 또는 로컬 캐시에서 로드
+    config = AutoConfig.from_pretrained(model_name_or_path)
+    model_cls = AUTO_MODEL_MAPPING[config.model_type]
+
     if load_in_8bit:
         hook_model = model_cls.from_pretrained(
-            model_name_or_path, 
-            device_map=device_map, 
-            load_in_8bit=True
+            model_name_or_path,
+            device_map=device_map,
+            load_in_8bit=True,
         )
     else:
         if device_map:
-            hook_model = model_cls.from_pretrained(model_name_or_path, device_map=device_map, torch_dtype=torch_dtype)
+            hook_model = model_cls.from_pretrained(model_name_or_path, device_map=device_map, torch_dtype=torch_dtype, trust_remote_code=True)
         else:
-            hook_model = model_cls.from_pretrained(model_name_or_path, torch_dtype=torch_dtype)
+            hook_model = model_cls.from_pretrained(model_name_or_path, torch_dtype=torch_dtype, trust_remote_code=True)
             if torch.cuda.is_available():
                 hook_model = hook_model.cuda()
         if convert_to_half:
             hook_model = hook_model.half()
-    
-    # hook_model = AutoModelForCausalLM.from_pretrained(model_name_or_path, trust_remote_code=True, use_auth_token=True, device_map=device_map, torch_dtype=torch_dtype)
-
 
     if not tokenizer_name_or_path:
         tokenizer_name_or_path = model_name_or_path
     try:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, use_fast=use_fast_tokenizer)
     except:
-        # some tokenizers (e.g., GPTNeoXTokenizer) don't have the slow or fast version, so we just roll back to the default one
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path)
-    # set padding side to left for batch generation
+
     tokenizer.padding_side = padding_side
-    # set pad token to eos token if pad token is not set (as is the case for llama models)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -604,51 +529,37 @@ def load_hooked_lm_and_tokenizer(
         if not isinstance(peft_name_or_path, list):
             peft_name_or_path = [peft_name_or_path]
         for path in peft_name_or_path:
-            peft_config = json.load(open(os.path.join(path, "adapter_config.json")))
-            setattr(hook_model, "peft_type", peft_config["peft_type"])
-            print(f"Load {peft_config['peft_type']} from {path}.")
-            if peft_config["peft_type"] == "PROMPT_TUNING":
-                hook_model.set_prompt_embeddings(path)
-            elif peft_config["peft_type"] == "IA3":
-                hook_model.set_ia3(path)
-            elif peft_config["peft_type"] == "LORA":
-                hook_model.set_lora(path, peft_config)
-            # model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch_dtype)
-            # peft_model = PeftModel.from_pretrained(model=model, model_id=peft_name_or_path)
-            # model = peft_model.merge_and_unload(progressbar=True)
-            # hook_model.from_hf_model(model)
-        
+            hook_model = PeftModel.from_pretrained(hook_model, path)
+            print(f"Loaded PEFT adapter from {path}")
+            # setattr(hook_model, "peft_type", peft_config.peft_type)
+
     hook_model.eval()
     print(f'Load {model_cls.__name__} successfully!')
-    # breakpoint()
-    # help(hook_model)
     return hook_model, tokenizer
 
 def load_hf_lm_and_tokenizer(
-        model_name_or_path, 
+        model_name_or_path,
         peft_name_or_path=None,
-        tokenizer_name_or_path=None, 
-        device_map="auto", 
+        tokenizer_name_or_path=None,
+        device_map="auto",
         torch_dtype="auto",
-        load_in_8bit=False, 
+        load_in_8bit=False,
         convert_to_half=False,
         gptq_model=False,
         use_fast_tokenizer=True,
         padding_side="left",
     ):
-    
-    from transformers import AutoModelForCausalLM, AutoTokenizer, OPTForCausalLM, GPTNeoXForCausalLM
 
     if gptq_model:
         from auto_gptq import AutoGPTQForCausalLM
         model_wrapper = AutoGPTQForCausalLM.from_quantized(
             model_name_or_path, device="cuda:0", use_triton=True
         )
-        model = model_wrapper.model  
+        model = model_wrapper.model
     elif load_in_8bit:
         model = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path, 
-            device_map=device_map, 
+            model_name_or_path,
+            device_map=device_map,
             load_in_8bit=True
         )
     else:
@@ -675,16 +586,17 @@ def load_hf_lm_and_tokenizer(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
-    
-    for path in peft_name_or_path:
-        model = PeftModel.from_pretrained(model=model, model_id=path)
+    #pad_id = tokenizer.convert_tokens_to_ids("<|finetune_right_pad_id|>")
+    #tokenizer.pad_token = "<|finetune_right_pad_id|>"
+    #tokenizer.pad_token_id = pad_id
 
-    # for OPT and Pythia models, we need to set tokenizer.model_max_length to model.config.max_position_embeddings 
-    # to avoid wrong embedding index.    
-    if isinstance(model, GPTNeoXForCausalLM) or isinstance(model, OPTForCausalLM):
-        tokenizer.model_max_length = model.config.max_position_embeddings
-        print("Set tokenizer.model_max_length to model.config.max_position_embeddings: {}".format(model.config.max_position_embeddings))
-        
+    # --- 오류가 발생한 부분을 아래와 같이 수정합니다. ---
+    if peft_name_or_path: # peft_name_or_path가 None이 아닐 때만 for 루프를 실행
+        if not isinstance(peft_name_or_path, list): # 단일 경로가 전달될 경우를 대비하여 리스트로 변환
+            peft_name_or_path = [peft_name_or_path]
+        for path in peft_name_or_path:
+            model = PeftModel.from_pretrained(model=model, model_id=path)
+
     return model, tokenizer
 
 def load_hf_score_lm_and_tokenizer(

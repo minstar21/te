@@ -489,6 +489,13 @@ class HookedPreTrainedModel(PreTrainedModel, HookedRootModule):
         # breakpoint()
         self._validate_model_class()
         generation_config, model_kwargs = self._prepare_generation_config(generation_config, **kwargs)
+        if not hasattr(generation_config, "_eos_token_tensor"):
+            eos_ids = (
+                [generation_config.eos_token_id]
+                if isinstance(generation_config.eos_token_id, int)
+                else generation_config.eos_token_id
+            )
+            generation_config._eos_token_tensor = torch.tensor(eos_ids, device="cpu")
         tmp = model_kwargs.copy()
         self._validate_model_kwargs(model_kwargs.copy())
 
@@ -512,6 +519,7 @@ class HookedPreTrainedModel(PreTrainedModel, HookedRootModule):
                 eos_token_id = eos_token_id[0]
             logger.warning(f"Setting `pad_token_id` to `eos_token_id`:{eos_token_id} for open-end generation.")
             generation_config.pad_token_id = eos_token_id
+
 
         # 3. Define model inputs
         # inputs_tensor has to be defined

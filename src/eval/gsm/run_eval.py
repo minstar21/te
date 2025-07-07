@@ -248,28 +248,9 @@ def main(args):
         )
         outputs = [result["output"] for result in results]
 
-    # not_patching_predictions = []
-    # for output in not_patching_outputs:
-    #     # replace numbers like `x,xxx` with `xxxx`
-    #     # output = re.sub(r"(\d),(\d)", r"\1\2", output)
-    #     # numbers = re.findall(r"[-+]?\d*\.\d+|\d+", output)
-    #     # if numbers:
-    #     #     not_patching_predictions.append(numbers[-1])
-    #     # else:
-    #         not_patching_predictions.append(output)
-    #     # not_patching_predictions.append(task.parse_answer(output))
-
     predictions = []
     for output in outputs:
-        # replace numbers like `x,xxx` with `xxxx`
-        # output = re.sub(r"(\d),(\d)", r"\1\2", output)
-        # numbers = re.findall(r"[-+]?\d*\.\d+|\d+", output)
-        # if numbers:
-        #     predictions.append(numbers[-1])
-        # else:
-            predictions.append(output)
-        # predictions.append(task.parse_answer(output))
-        
+      
     # breakpoint()
     print("Calculating accuracy of patching model...")
     targets = [example["answer"] for example in test_data]
@@ -284,25 +265,10 @@ def main(args):
     # print(f"Exact match of contaminated model : {not_patching_em_score}")
     print(f"Exact match of patching contaminated model : {em_score}")
 
-    # predictions = [{
-    #     "question": example["question"],
-    #     "answer": example["answer"],
-    #     "contaminated_model_output": contaminated_output,
-    #     "contaminated_prediction": contaminated_pred,
-    #     "patching_model_output": output,
-    #     "patching_prediction": pred
-    # } for example, contaminated_output, contaminated_pred, output, pred in zip(test_data, not_patching_outputs, not_patching_predictions, outputs, predictions)]
-
     with open(os.path.join(args.save_dir, f"predictions.jsonl"), "w") as fout:
         for prediction in predictions:
             fout.write(json.dumps(prediction) + "\n") 
     
-    # with open(os.path.join(args.save_dir, "metrics.json"), "w") as fout:
-    #     json.dump({
-    #         "exact_match of contaminated model": not_patching_em_score,
-    #         "exact_match of patching model": em_score
-    #     }, fout, indent=4)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -455,3 +421,20 @@ if __name__ == "__main__":
     # model_name_or_path and openai_engine cannot be both None or both not None.
     assert (args.model_name_or_path is None) != (args.openai_engine is None), "Either model_name_or_path or openai_engine should be specified."
     main(args)
+
+'''
+python -m src.eval.gsm.run_eval \
+            --data_dir /test-data/path \
+            --max_num_examples NUM_SAMPLE \
+            --save_dir results/gsm \
+            --model MODEL \
+            --model_name_or_path model_root/MODEL \
+            --tokenizer model_root/MODEL \
+            --eval_batch_size 10 \
+            --use_chat_format \
+            --red_model_name_or_path /model/to/be/patched  \
+            --blue_model_name_or_path /guided_model/path (Use the parameters of this model to patch the shortcut neurons of the target model)  \
+            --index_path /shortcut/neuron/path.pt \
+            --hooked \
+            --patch_num /shortcut/neuron/number (consider TopK neurons as shortcut neuron)
+'''

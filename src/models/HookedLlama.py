@@ -1,24 +1,3 @@
-
-# coding=utf-8
-# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
-#
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-""" PyTorch LLaMA model."""
 import math
 import warnings
 from typing import Dict, List, Optional, Tuple, Union
@@ -70,12 +49,6 @@ def _get_unpad_data(padding_mask):
     )
 
 class LlamaHookPoint(HookPoint):
-    """
-    A helper class to access intermediate activations in a PyTorch model (inspired by Garcon).
-
-    LlamaHookPoint is a dummy module that acts as an identity function by default. By wrapping any
-    intermediate activation in a LlamaHookPoint, it provides a convenient way to add PyTorch hooks.
-    """
 
     def __init__(self):
         super().__init__()
@@ -337,6 +310,14 @@ class LlamaAttention(nn.Module):
                 max_position_embeddings=self.max_position_embeddings,
                 base=self.rope_theta,
             )
+        elif "rope_type" in self.config.rope_scaling and self.config.rope_scaling["rope_type"] == "llama3":
+            # LLaMA3-style RoPE
+            self.rotary_emb = LlamaRotaryEmbedding(  # 또는 새로운 Llama3RoPEEmbedding이 있다면 그걸 사용
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=self.rope_theta,
+                scaling_factor=self.config.rope_scaling["factor"]
+            )
         else:
             scaling_type = self.config.rope_scaling["type"]
             scaling_factor = self.config.rope_scaling["factor"]
@@ -384,6 +365,7 @@ class LlamaAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        print(f"DEBUG(LlamaAttention.forward): hidden_states.shape BEFORE unpack: {hidden_states.shape}")
         bsz, q_len, _ = hidden_states.size()
 
         if self.config.pretraining_tp > 1:
